@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+#
+# Start a single-process Pelican federation for conformance tests.
+#
+# Tier 1: director + registry + origin, with the origin on the "posixv2" storage
+# backend.  That backend is Go-native, so `launchers/origin_serve.go` skips all
+# XRootD startup and the whole federation is one downloaded binary -- no
+# container image, no XRootD, no package installs.  A cache cannot join a
+# federation built this way (the cache launcher is unconditionally XRootD-based);
+# that is what the tier-2 job in the pelican-dev image is for.
+#
+# Writes a shell-sourceable env file describing the federation, so the Java tests
+# find it without hard-coding anything.
+#
+# Usage:
+#   ci/start-federation.sh [env-file]        # default: /tmp/pelican-federation.env
+#
+# Environment:
+#   PELICAN_VERSION   release to download (default below); "local" uses a
+#                     pelican-server already on PATH
+#   PELICAN_PORT      web port (default 8444)
+#   PELICAN_WORKDIR   where config, data and logs go (default /tmp/pelican-fed)
+#   PELICAN_WITH_CACHE  set to 1 to add a cache module. Requires XRootD on the host --
+#                     the cache launcher is unconditionally XRootD-based -- so this only
+#                     works inside an image that carries it (tier 2).
+
+set -euo pipefail
+
+PELICAN_VERSION="${PELICAN_VERSION:-7.26.2}"
+PELICAN_PORT="${PELICAN_PORT:-8444}"
+PELICAN_WORKDIR="${PELICAN_WORKDIR:-/tmp/pelican-fed}"
+PELICAN_WITH_CACHE="${PELICAN_WITH_CACHE:-0}"
+ENV_FILE="${1:-/tmp/pelican-federation.env}"
+
+CONFIG_DIR="${PELICAN_WORKDIR}/config"
+DATA_DIR="${PELICAN_WORKDIR}/data"
+BIN_DIR="${PELICAN_WORKDIR}/bin"
+LOG_FILE="${PELICAN_WORKDIR}/server.log"
+PID_FILE="${PELICAN_WORKDIR}/server.pid"
+
+DISCOVERY_URL="https://localhost:${PELICAN_PORT}"
+PUBLIC_PREFIX="/test/public"
+PROTECTED_PREFIX="/test/protected"
+
+log() { printf '==> %s\n' "$*" >&2; }
+fail() { printf '!!! %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- the binary
+
+install_pelican_server() {
+  if [ "${PELICAN_VERSION}" = "local" ]; then
+    command -v pelican-server >/dev/null || fail "PELICAN_VERSION=local but no pelican-server on PATH"
+    ln -sf "$(command -v pelican-server)" "${BIN_DIR}/pelican-server"
+    return
+  fi
+
+  local os arch asset url
+  case "$(uname -s)" in
+    Linux) os=Linux ;;
+    Darwin) os=Darwin ;;
+    *) fail "unsupported OS $(uname -s)" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch=x86_64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    ppc64le) arch=ppc64le ;;
+    *) fail "unsupported architecture $(uname -m)" ;;
+  esac
+
+  asset="pelican-server_${os}_${arch}.tar.gz"
+  url="https://github.com/PelicanPlatform/pelican/releases/download/v${PELICAN_VERSION}/${asset}"
+  log "Downloading ${asset} (v${PELICAN_VERSION})"
+  curl -fsSL "${url}" -o "${PELICAN_WORKDIR}/${asset}" \
+    || fail "could not download ${url}"
+  tar -xzf "${PELICAN_WORKDIR}/${asset}" -C "${PELICAN_WORKDIR}"
+  # The tarball unpacks into a versioned directory; find the binary wherever it landed.
+  local found
+  found="$(find "${PELICAN_WORKDIR}" -name pelican-server -type f -perm -u+x | head -1)"
+  [ -n "${found}" ] || fail "no pelican-server binary inside ${asset}"
+  install -m 755 "${found}" "${BIN_DIR}/pelican-server"
+}
+
+# ---------------------------------------------------------------- daemon user
+
+ensure_daemon_user() {
+  # config/privs.go looks up the "xrootd" system user only when the process runs
+  # as root; a non-root process uses its own identity and needs nothing. So this
+  # matters for container-based jobs (which run as root) and is a no-op on a
+  # normal runner. The user is needed even by a posixv2 origin that never starts
+  # XRootD, because the lookup sits outside the "does this server launch XRootD"
+  # check.
+  [ "$(id -u)" -eq 0 ] || return 0
+  id xrootd >/dev/null 2>&1 && return 0
+  if command -v useradd >/dev/null 2>&1; then
+    log "Creating the 'xrootd' system user (running as root)"
+    groupadd -r xrootd 2>/dev/null || true
+    useradd -r -g xrootd -s /sbin/nologin xrootd 2>/dev/null || true
+  fi
+  id xrootd >/dev/null 2>&1 \
+    || fail "running as root without an 'xrootd' user, and could not create one; run as a non-root user instead"
+}
+
+# ---------------------------------------------------------------- config
+
+write_config() {
+  mkdir -p "${DATA_DIR}/public" "${DATA_DIR}/protected"
+  echo "hello from a public namespace" > "${DATA_DIR}/public/hello.txt"
+  echo "0123456789" > "${DATA_DIR}/public/range.txt"
+  mkdir -p "${DATA_DIR}/public/subdir/nested"
+  echo "a" > "${DATA_DIR}/public/subdir/a.txt"
+  echo "bb" > "${DATA_DIR}/public/subdir/b.txt"
+  echo "deep" > "${DATA_DIR}/public/subdir/nested/deep.txt"
+  echo "protected contents" > "${DATA_DIR}/protected/secret.txt"
+
+  # The registry module refuses to start without an OIDC client configured, even
+  # though no browser login happens here. A placeholder satisfies it.
+  echo -n "conformance-placeholder" > "${CONFIG_DIR}/oidc-client-secret"
+
+  cat > "${CONFIG_DIR}/pelican.yaml" <<EOF
+# Generated by ci/start-federation.sh -- not a production configuration.
+# ConfigBase is where generated state lands: the TLS CA, the issuer keys, the
+# SQLite databases. Pinning it keeps a test federation out of /etc/pelican (the
+# root default) and makes the CA findable at a known path.
+ConfigBase: ${CONFIG_DIR}
+OIDC:
+  ClientID: conformance-placeholder
+  ClientSecretFile: ${CONFIG_DIR}/oidc-client-secret
+Server:
+  HostName: localhost
+  WebPort: ${PELICAN_PORT}
+  # The AUP gate would redirect authenticated pages to an "I agree" screen; no
+  # web UI is exercised here.
+  AUPFile: none
+Federation:
+  DiscoveryUrl: ${DISCOVERY_URL}
+Logging:
+  Level: info
+# The server's own internal clients talk to this same self-signed instance.
+# The Java client under test does NOT skip verification: it is handed the
+# generated CA instead, so the real TLS path is exercised.
+TLSSkipVerify: true
+Cache:
+  Port: 8442
+Origin:
+  StorageType: posixv2
+  Exports:
+    - StoragePrefix: "${DATA_DIR}/public"
+      FederationPrefix: "${PUBLIC_PREFIX}"
+      Capabilities: ["PublicReads", "Writes", "Listings", "DirectReads"]
+    - StoragePrefix: "${DATA_DIR}/protected"
+      FederationPrefix: "${PROTECTED_PREFIX}"
+      Capabilities: ["Reads", "Writes", "Listings", "DirectReads"]
+EOF
+}
+
+# ---------------------------------------------------------------- lifecycle
+
+modules() {
+  if [ "${PELICAN_WITH_CACHE}" = "1" ]; then
+    command -v xrootd >/dev/null 2>&1 \
+      || fail "PELICAN_WITH_CACHE=1 needs XRootD on PATH; the cache launcher always starts one"
+    echo "director,registry,origin,cache"
+  else
+    echo "director,registry,origin"
+  fi
+}
+
+start_server() {
+  local module_list
+  module_list="$(modules)"
+  log "Starting ${module_list} on port ${PELICAN_PORT}"
+  (
+    export PELICAN_CONFIGBASE="${CONFIG_DIR}"
+    # --config explicitly, rather than relying on config-directory discovery:
+    # where a bare pelican.yaml is picked up from has changed between releases,
+    # and a silently-ignored config file shows up as a baffling "prefix is empty"
+    # rather than as a missing file.
+    exec "${BIN_DIR}/pelican-server" serve \
+      --config "${CONFIG_DIR}/pelican.yaml" \
+      --module "${module_list}"
+  ) > "${LOG_FILE}" 2>&1 &
+  echo $! > "${PID_FILE}"
+}
+
+wait_until_ready() {
+  local pid attempt
+  pid="$(cat "${PID_FILE}")"
+  for attempt in $(seq 1 60); do
+    # Fail fast if it died, rather than burning the whole timeout on a corpse.
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      log "Server exited during startup; last 40 lines:"
+      tail -40 "${LOG_FILE}" >&2
+      fail "pelican-server died before becoming ready"
+    fi
+    if curl -sk "${DISCOVERY_URL}/api/v1.0/health" >/dev/null 2>&1 \
+        && curl -sk "${DISCOVERY_URL}/.well-known/pelican-configuration" >/dev/null 2>&1 \
+        && compgen -G "${CONFIG_DIR}/issuer-keys/*.pem" >/dev/null; then
+      log "Ready after ${attempt} poll(s)"
+      return 0
+    fi
+    sleep 2
+  done
+  log "Server never became ready; last 40 lines:"
+  tail -40 "${LOG_FILE}" >&2
+  fail "timed out waiting for the federation"
+}
+
+mint_token() {
+  # Ask the Director which issuer this namespace accepts, rather than assuming.
+  # Which issuer serves a namespace depends on whether the origin runs a per-export
+  # issuer, and the answer has moved between releases -- so read it off
+  # X-Pelican-Token-Generation, which is the authoritative statement.
+  local issuer
+  issuer="$(curl -skD- -o /dev/null "${DISCOVERY_URL}${PROTECTED_PREFIX}/probe" \
+            | tr -d '\r' \
+            | sed -n 's/^[Xx]-[Pp]elican-[Tt]oken-[Gg]eneration:.*issuer=\([^,]*\).*/\1/p' \
+            | head -1)"
+  [ -n "${issuer}" ] || fail "the Director advertised no token issuer for ${PROTECTED_PREFIX}"
+  log "Namespace issuer: ${issuer}"
+
+  # Scopes are relative to the namespace's base path (also advertised by the
+  # Director), so "/" means all of ${PROTECTED_PREFIX}.
+  PELICAN_CONFIGBASE="${CONFIG_DIR}" "${BIN_DIR}/pelican-server" origin token create \
+    --config "${CONFIG_DIR}/pelican.yaml" \
+    --profile wlcg \
+    --scope "storage.read:/ storage.create:/ storage.modify:/" \
+    --issuer "${issuer}" \
+    --audience "${DISCOVERY_URL}" \
+    --audience "${issuer}" \
+    --audience "https://wlcg.cern.ch/jwt/v1/any" \
+    --lifetime 7200 \
+    --subject conformance-test
+}
+
+write_env_file() {
+  local token="$1"
+  cat > "${ENV_FILE}" <<EOF
+export PELICAN_TEST_DISCOVERY_URL="${DISCOVERY_URL}"
+export PELICAN_TEST_CA_FILE="${CONFIG_DIR}/certificates/tlsca.pem"
+export PELICAN_TEST_PUBLIC_PREFIX="${PUBLIC_PREFIX}"
+export PELICAN_TEST_PROTECTED_PREFIX="${PROTECTED_PREFIX}"
+export PELICAN_TEST_TOKEN="${token}"
+export PELICAN_TEST_LOG="${LOG_FILE}"
+export PELICAN_TEST_PID="${PID_FILE}"
+export PELICAN_TEST_HAS_CACHE="${PELICAN_WITH_CACHE}"
+EOF
+  log "Wrote ${ENV_FILE}"
+}
+
+main() {
+  mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${BIN_DIR}"
+  install_pelican_server
+  ensure_daemon_user
+  write_config
+  start_server
+  wait_until_ready
+  local token
+  token="$(mint_token)"
+  [ -n "${token}" ] || fail "could not mint a test token"
+  write_env_file "${token}"
+  log "Federation is up. Stop it with: kill \$(cat ${PID_FILE})"
+}
+
+main "$@"

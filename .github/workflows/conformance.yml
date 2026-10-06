@@ -1,0 +1,127 @@
+---
+name: Conformance
+
+# Runs the client against a real Pelican federation, which is the only thing that can
+# check this library's reading of the protocol against a server rather than against its
+# own fake.
+#
+# Two tiers, because they cost very differently:
+#
+#   tier 1 (every PR)  director + registry + origin on the native "posixv2" backend.
+#                      That backend launches no XRootD, so the whole federation is one
+#                      downloaded binary on a plain runner -- about a minute.
+#
+#   tier 2 (nightly)   adds a cache, which is unconditionally XRootD-based and so needs
+#                      the pelican-dev image. It is the only way to reach the behaviors
+#                      that only a cache produces: the PROPFIND-409 fallback to the
+#                      namespace's collections endpoint, failover across several servers,
+#                      and XRootD's own checksum encoding.
+
+env:
+  # One place to bump. Pinned for reproducibility; the nightly leg floats the *image*
+  # (and therefore XRootD) instead, which is where drift actually shows up.
+  #
+  # NOTE: 26.0.0-rc.0 is the earliest release in which a posixv2 origin starts without
+  # XRootD installed (PelicanPlatform/pelican d8812204 "require the binary only for
+  # servers that launch it"). Earlier releases cannot run tier 1 at all.
+  PELICAN_VERSION: "26.0.0-rc.0"
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly, so tier 2 catches upstream drift without gating every PR on it.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      # No federation: this leg must stay hermetic and offline, and fails if a test
+      # quietly starts needing the network.
+      - run: mvn --batch-mode verify
+
+  federation:
+    name: Conformance (origin only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Start a federation
+        run: ci/start-federation.sh "${GITHUB_WORKSPACE}/federation.env"
+
+      - name: Run conformance tests
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          . "${GITHUB_WORKSPACE}/federation.env"
+          set +a
+          mvn --batch-mode test -Dtest.excludedGroups= -Dgroups=federation
+
+      - name: Federation log
+        if: failure()
+        run: tail -200 /tmp/pelican-fed/server.log
+
+      - name: Stop the federation
+        if: always()
+        run: ci/stop-federation.sh
+
+  federation-with-cache:
+    name: Conformance (origin + cache, XRootD)
+    # Nightly and on demand only: it needs the dev image, and a cache is the slow part.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      # The image Pelican's own CI uses; it carries XRootD.
+      image: hub.opensciencegrid.org/pelican_platform/pelican-dev:latest-itb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Start a federation with a cache
+        env:
+          PELICAN_WITH_CACHE: "1"
+        run: ci/start-federation.sh "${GITHUB_WORKSPACE}/federation.env"
+
+      - name: Run conformance tests
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          . "${GITHUB_WORKSPACE}/federation.env"
+          set +a
+          mvn --batch-mode test -Dtest.excludedGroups= -Dgroups=federation
+
+      - name: Federation log
+        if: failure()
+        run: tail -200 /tmp/pelican-fed/server.log
+
+      - name: Stop the federation
+        if: always()
+        run: ci/stop-federation.sh
