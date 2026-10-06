@@ -379,6 +379,25 @@ class PelicanClientTest {
     }
 
     @Test
+    void fallsBackWhenACacheRedirectsAListingToAnotherHost() {
+        // The native Go cache answers PROPFIND on a collection with a 307 to the origin
+        // rather than with the 409 an XRootD cache returns. Following that redirect would
+        // mean talking to a host the Director never named, and carrying the caller's
+        // credential there, so the client goes to the advertised collections endpoint
+        // instead -- the same place the 409 path ends up.
+        federation.directorServers("cache1").collectionsServer("origin");
+        String elsewhere = "localhost:" + federation.discoveryUri().getPort();
+        federation.objectServer("cache1").redirectPropfindTo(elsewhere).collection("/ns/data");
+        federation.objectServer("origin").collection("/ns/data").put("/ns/data/a", "aaa");
+
+        try (PelicanClient client = clientBuilder().build();
+                Stream<ObjectInfo> entries = client.list("data")) {
+            assertThat(entries.map(ObjectInfo::name)).containsExactly("a");
+        }
+        assertThat(federation.objectServer("cache1").requestCount()).isEqualTo(1);
+    }
+
+    @Test
     void usesADirectorThatAnswersPropfindItself() {
         federation.directorServers("origin").collectionsServer("origin").directorProxiesPropfind(true);
         federation.objectServer("origin").collection("/ns/data").put("/ns/data/a", "aaa");

@@ -5,17 +5,15 @@ name: Conformance
 # check this library's reading of the protocol against a server rather than against its
 # own fake.
 #
-# Two tiers, because they cost very differently:
+# The whole federation -- director, registry, origin and cache -- runs from one
+# downloaded binary on a plain runner. Neither native backend starts XRootD:
+# Origin.StorageType=posixv2 and Cache.EnableV2 both make serverLaunchesXrootd() false.
 #
-#   tier 1 (every PR)  director + registry + origin on the native "posixv2" backend.
-#                      That backend launches no XRootD, so the whole federation is one
-#                      downloaded binary on a plain runner -- about a minute.
-#
-#   tier 2 (nightly)   adds a cache, which is unconditionally XRootD-based and so needs
-#                      the pelican-dev image. It is the only way to reach the behaviors
-#                      that only a cache produces: the PROPFIND-409 fallback to the
-#                      namespace's collections endpoint, failover across several servers,
-#                      and XRootD's own checksum encoding.
+# The one thing this cannot cover is XRootD's own behavior, which differs from the
+# native implementations in ways the client has to handle -- an XRootD cache answers
+# PROPFIND on a collection with 409 where the Go cache answers 307, and it encodes
+# crc32c as base64 where the registry says hex. That needs the pelican-dev image and is
+# left for a follow-up.
 
 env:
   # One place to bump. Pinned for reproducibility; the nightly leg floats the *image*
@@ -58,7 +56,7 @@ jobs:
       - run: mvn --batch-mode verify
 
   federation:
-    name: Conformance (origin only)
+    name: Conformance (origin + cache)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -70,42 +68,6 @@ jobs:
           cache: maven
 
       - name: Start a federation
-        run: ci/start-federation.sh "${GITHUB_WORKSPACE}/federation.env"
-
-      - name: Run conformance tests
-        run: |
-          set -a
-          # shellcheck disable=SC1091
-          . "${GITHUB_WORKSPACE}/federation.env"
-          set +a
-          mvn --batch-mode test -Dtest.excludedGroups= -Dgroups=federation
-
-      - name: Federation log
-        if: failure()
-        run: tail -200 /tmp/pelican-fed/server.log
-
-      - name: Stop the federation
-        if: always()
-        run: ci/stop-federation.sh
-
-  federation-with-cache:
-    name: Conformance (origin + cache, XRootD)
-    # Nightly and on demand only: it needs the dev image, and a cache is the slow part.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    container:
-      # The image Pelican's own CI uses; it carries XRootD.
-      image: hub.opensciencegrid.org/pelican_platform/pelican-dev:latest-itb
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
-
-      - name: Start a federation with a cache
         env:
           PELICAN_WITH_CACHE: "1"
         run: ci/start-federation.sh "${GITHUB_WORKSPACE}/federation.env"

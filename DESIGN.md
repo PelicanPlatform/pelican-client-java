@@ -692,16 +692,26 @@ brings up a real federation and the tests run against it, concentrating on where
 wrong is plausible and silent. They are excluded from `mvn test` by default, so the
 ordinary build stays hermetic and offline.
 
-Two tiers, because they cost very differently:
+The whole federation — director, registry, origin **and cache** — runs from one
+downloaded binary on a plain runner, in about ten seconds. Neither native backend starts
+XRootD: `serverLaunchesXrootd()` is false for `Origin.StorageType: posixv2` and for
+`Cache.EnableV2` alike.
 
-| Tier | What it runs | Why |
-| --- | --- | --- |
-| 1 — every PR | `director,registry,origin` on the `posixv2` backend | That backend launches no XRootD (`launchers/origin_serve.go` guards it behind `useXRootD`), so the federation is one downloaded binary on a plain runner. About a minute. |
-| 2 — nightly | adds `cache` in the `pelican-dev` image | The cache launcher is unconditionally XRootD-based. It is the only way to reach cache-only behavior: the PROPFIND-409 fallback, failover across several servers, and XRootD's checksum encoding. |
+What that still cannot cover is XRootD's own behavior, which differs from the native
+implementations in ways the client has to handle: an XRootD cache answers `PROPFIND` on a
+collection with 409 where the Go cache answers 307, and it encodes `crc32c` as base64
+where the IANA registry says hex. Reaching those needs the `pelican-dev` image, and is
+left for a follow-up.
 
-Tier 1 requires Pelican **26.0.0-rc.0 or later**: the fix that stops a native-backend
-origin from demanding an XRootD binary (`d8812204`) is not in any earlier release, so
-7.26.2 cannot run it at all.
+This requires Pelican **26.0.0-rc.0 or later**: the fix that stops a native-backend origin
+from demanding an XRootD binary (`d8812204`) is not in any earlier release, so 7.26.2
+cannot run it at all.
+
+A cache also needs `Server.AdvertisementInterval` shortened. A cache can only offer a
+namespace it learned from the Director, so at the 1-minute default it is not routable
+until roughly 90 seconds after the origin registers; the parameter exists to be shortened
+for tests, and the start script sets it to 5s and then waits for the Director to actually
+advertise the cache rather than for the process to exist.
 
 **What the first conformance run found.** Four failures, all real:
 
@@ -720,6 +730,16 @@ origin from demanding an XRootD binary (`d8812204`) is not in any earlier releas
 4. **Not every origin answers `Want-Digest`.** A posixv2 origin with no cached checksums
    reports none, and the client's "you asked for verification and did not get it" error is
    correct. The test now asserts that contract rather than assuming a digest exists.
+
+Adding a cache then found a fifth, which the live federation could not have caught on its
+own: **the native cache redirects a listing to the origin** (307) where an XRootD cache
+returns 409. In a single-process test federation the redirect stays on the same authority,
+so following it works by accident; in a real federation the cache is a different host and
+the client refused to follow, failing the listing. Following it would be wrong — the
+Director decides which hosts this client talks to, and chasing an object server's redirect
+to one it never named would carry the caller's credential there — so an unfollowed redirect
+now triggers the same collections-endpoint fallback as a 409. A unit test covers it with
+hosts the fake federation can make differ.
 
 It also confirmed two design decisions that would have been expensive to get wrong: a real
 `Link` URL carries the origin's own path prefix (`/api/v1.0/origin/data/test/public/obj`),
@@ -774,7 +794,8 @@ What exists, builds and is covered by tests (117 of them, `./mvn.sh test`):
 | `stat`, `list` (lazy, recursive, collections fallback), `get` (ranges, digests) | Done. |
 | `put`, `delete`, `createCollection`, `move`, `capabilities` | Done. |
 | Error model, generated `PelicanErrorCode` | Done. Codes are generated from `docs/error_codes.yaml`; `codegen/refresh.sh` re-vendors. |
-| Conformance against a live federation | Tier 1 done: 14 tests, `ci/start-federation.sh` + `.github/workflows/conformance.yml`. Tier 2 (with a cache) is written but **unverified** — it needs XRootD, which was not available where this was developed. |
+| Conformance against a live federation | Done: 14 tests against director + registry + origin + cache, all native backends, no XRootD and no container. Green in CI. |
+| Conformance against XRootD-backed servers | **Not done.** Needs the `pelican-dev` image; it is where the 409-on-PROPFIND path and base64 `crc32c` actually live. |
 | Third-party copy (`copy`, `CopyRequest`) | **Not implemented.** Phase 4. The Tapis bridge streams through the service meanwhile. |
 | `shareUrl` | **Not implemented.** Phase 4. |
 | Apache5 transport, CLI, cross-implementation conformance suite | **Not implemented.** Phase 5. |

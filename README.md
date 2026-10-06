@@ -70,16 +70,19 @@ library's reading of the protocol rather than against a server. The conformance 
 the reading:
 
 ```sh
-ci/start-federation.sh /tmp/fed.env    # downloads pelican-server, starts director+registry+origin
+PELICAN_WITH_CACHE=1 ci/start-federation.sh /tmp/fed.env
 . /tmp/fed.env
 mvn test -Dtest.excludedGroups= -Dgroups=federation
 ci/stop-federation.sh
 ```
 
-No XRootD and no container needed: the origin runs on the native `posixv2` backend. Needs
-Pelican 26.0.0-rc.0 or later — earlier releases require an XRootD binary even for a backend
-that never starts one. They are excluded from `mvn test` by default, so the ordinary build
-stays offline.
+That brings up a director, registry, origin and cache from one downloaded binary in about
+ten seconds. No XRootD and no container: both native backends (`Origin.StorageType:
+posixv2` and `Cache.EnableV2`) start none. Needs Pelican 26.0.0-rc.0 or later — earlier
+releases demand an XRootD binary even for a backend that never starts one.
+
+Conformance tests are excluded from `mvn test` by default, so the ordinary build stays
+offline.
 
 ## Regenerating error codes
 

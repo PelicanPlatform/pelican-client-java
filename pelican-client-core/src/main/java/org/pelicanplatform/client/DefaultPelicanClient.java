@@ -484,8 +484,10 @@ final class DefaultPelicanClient implements PelicanClient {
         }
     }
 
+    /** Whether every server said, in one dialect or another, "I do not serve listings". */
     private static boolean sawConflict(AllServersFailedException e) {
-        return e.failures().stream().anyMatch(f -> f.statusCode() == HTTP_CONFLICT);
+        return e.failures().stream()
+                .anyMatch(f -> f.statusCode() == HTTP_CONFLICT || isRedirect(f.statusCode()));
     }
 
     /** Servers for the collections-endpoint fallback: the one URL the namespace advertises. */
@@ -499,14 +501,27 @@ final class DefaultPelicanClient implements PelicanClient {
     }
 
     /**
-     * A cache cannot list, so a 409 has to be taken elsewhere rather than treated as the
-     * conflict it would mean on a write.
+     * Caches do not serve listings, and they say so in two different ways.
+     *
+     * <p>An XRootD cache answers {@code PROPFIND} on a collection with {@code 409 Conflict}.
+     * The native Go cache instead answers {@code 307} pointing at the origin. Neither is a
+     * failure of the request, and neither is the conflict a 409 would mean on a write -- both
+     * mean "ask the origin", so both are taken elsewhere.
+     *
+     * <p>The redirect is deliberately not followed when it leaves the server: the Director
+     * decides which hosts this client talks to, and chasing an object server's redirect to a
+     * host it never named would both bypass that and carry the caller's credential there. The
+     * namespace already advertises where listings live, so the fallback goes to that instead.
      */
     private static Disposition classifyPropfind(int statusCode) {
-        if (statusCode == HTTP_CONFLICT) {
+        if (statusCode == HTTP_CONFLICT || isRedirect(statusCode)) {
             return Disposition.NEXT_SERVER;
         }
         return Disposition.of(statusCode);
+    }
+
+    private static boolean isRedirect(int statusCode) {
+        return statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308;
     }
 
     private Optional<ObjectInfo> propfind(ServerAttempt attempt, ObjectPath path, int depth)
@@ -665,7 +680,7 @@ final class DefaultPelicanClient implements PelicanClient {
             throws IOException {
         HttpResponseHandle response = attempt.transport().execute(spec);
         int status = response.statusCode();
-        if (status != 301 && status != 302 && status != 307 && status != 308) {
+        if (!isRedirect(status)) {
             return response;
         }
         String location = response.headers().firstOrNull("Location");

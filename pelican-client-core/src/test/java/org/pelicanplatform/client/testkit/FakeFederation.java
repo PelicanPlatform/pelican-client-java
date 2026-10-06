@@ -69,6 +69,7 @@ public final class FakeFederation implements AutoCloseable {
         volatile int forcedStatus = 0;
         volatile String forcedBody = "";
         volatile boolean refusesPropfind;
+        volatile String propfindRedirectHost;
         final AtomicInteger requestCount = new AtomicInteger();
         final List<String> seenAuthorization = new CopyOnWriteArrayList<>();
 
@@ -101,6 +102,18 @@ public final class FakeFederation implements AutoCloseable {
         /** Behave like an XRootD cache: refuse PROPFIND on a collection with 409. */
         public ObjectServerSpec refusePropfind() {
             this.refusesPropfind = true;
+            return this;
+        }
+
+        /**
+         * Behave like the native Go cache: redirect PROPFIND to another host.
+         *
+         * <p>The host spelling is what matters. A client must not chase an object server's
+         * redirect to a host the Director never named, so the test needs the target to differ
+         * in authority from the server that issued it while still being reachable.
+         */
+        public ObjectServerSpec redirectPropfindTo(String hostAndPort) {
+            this.propfindRedirectHost = hostAndPort;
             return this;
         }
 
@@ -461,6 +474,15 @@ public final class FakeFederation implements AutoCloseable {
         Entry entry = spec.entries.get(objectPath);
         if (entry == null) {
             respond(exchange, 404, "not found".getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+        if (spec.propfindRedirectHost != null && entry.collection()) {
+            exchange
+                    .getResponseHeaders()
+                    .add(
+                            "Location",
+                            "http://" + spec.propfindRedirectHost + encode(fullPath));
+            respond(exchange, 307, new byte[0]);
             return;
         }
         if (spec.refusesPropfind && entry.collection()) {
