@@ -412,10 +412,19 @@ final class DefaultPelicanClient implements PelicanClient {
 
     // ---------------------------------------------------------------- capabilities
 
+    /**
+     * Ask an <em>origin</em> what it supports.
+     *
+     * <p>Write-flavored on purpose. Everything a caller asks this for -- {@code MKCOL},
+     * {@code MOVE}, third-party copy -- is an origin-side operation, and a read-flavored
+     * resolution lands on a cache instead. Caches do not implement {@code OPTIONS} at all
+     * (the native cache answers 405), so asking one both fails and answers the wrong
+     * question.
+     */
     @Override
     public Capabilities capabilities(ObjectPath path) {
         return pipeline.execute(
-                Plan.<Capabilities>builder("options", path, DirectorFlavor.READ)
+                Plan.<Capabilities>builder("options", path, DirectorFlavor.WRITE)
                         .scopes(List.of(ScopeRequest.of(StorageAction.READ, path)))
                         .action(
                                 attempt -> {

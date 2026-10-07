@@ -692,10 +692,16 @@ brings up a real federation and the tests run against it, concentrating on where
 wrong is plausible and silent. They are excluded from `mvn test` by default, so the
 ordinary build stays hermetic and offline.
 
-The whole federation — director, registry, origin **and cache** — runs from one
-downloaded binary on a plain runner, in about ten seconds. Neither native backend starts
-XRootD: `serverLaunchesXrootd()` is false for `Origin.StorageType: posixv2` and for
+The federation runs as **three separate processes** — director+registry, origin, cache —
+from one downloaded binary on a plain runner. Neither native backend starts XRootD:
+`serverLaunchesXrootd()` is false for `Origin.StorageType: posixv2` and for
 `Cache.EnableV2` alike.
+
+Separate processes rather than one, because co-location hides bugs. A single-process
+federation shares a config, a TLS identity, an issuer key, a hostname, a port and a
+database between services that are separate everywhere else, and anything that only breaks
+across a process boundary passes there and fails in production. Standing the three up
+separately immediately turned up four such things (below), two of them in this client.
 
 What that still cannot cover is XRootD's own behavior, which differs from the native
 implementations in ways the client has to handle: an XRootD cache answers `PROPFIND` on a
@@ -731,7 +737,31 @@ advertise the cache rather than for the process to exist.
    reports none, and the client's "you asked for verification and did not get it" error is
    correct. The test now asserts that contract rather than assuming a digest exists.
 
-Adding a cache then found a fifth, which the live federation could not have caught on its
+Splitting the single process into three then found four more. Two were configuration, and
+are the reason a single-process federation is not worth trusting:
+
+- **Two services cannot share a server name.** The registry records which key owns a name.
+  Co-located, origin and cache share one key and one hostname, so nothing complains; split
+  apart, the cache could not prove it owned `localhost` and its registration was refused
+  outright (`unable to verify you own the registered server "localhost"`). Each service now
+  gets its own `Xrootd.Sitename`.
+- **Several state paths default to shared locations under root** —
+  `Monitoring.DataLocation` and every `*.DbLocation` land under `/var/lib/pelican`. Three
+  processes then fought over one Prometheus TSDB and one `pelican.sqlite`, which surfaced
+  as a lock failure, a `UNIQUE constraint failed: users.username` on the admin user each
+  process self-enrolls, and — because an unhealthy cache is dropped by the Director
+  (`Director.FilterCachesInErrorState` defaults to true) — a cache that registered
+  successfully and was simply never routed to. All of them are now pinned per process.
+
+The other two were client bugs:
+
+- **`capabilities()` was read-flavored**, so it asked a *cache* what verbs it supports.
+  Caches answer `OPTIONS` with 405, and every verb a caller asks about — `MKCOL`, `MOVE`,
+  third-party copy — is origin-side anyway. It is write-flavored now. Co-located, the cache
+  and origin were the same server, so this could not fail.
+- The cache's listing redirect, below.
+
+And the cache itself found a fifth, which the live federation could not have caught on its
 own: **the native cache redirects a listing to the origin** (307) where an XRootD cache
 returns 409. In a single-process test federation the redirect stays on the same authority,
 so following it works by accident; in a real federation the cache is a different host and

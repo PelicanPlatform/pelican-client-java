@@ -104,6 +104,9 @@ public interface PelicanClient extends AutoCloseable {
      * <p>Worth asking before relying on {@code MKCOL}, {@code MOVE} or third-party copy:
      * what an origin serves depends on its storage backend, and the answer is only available
      * at runtime.
+     *
+     * <p>Answers for an origin, not a cache. Those verbs are all origin-side, and caches do
+     * not implement {@code OPTIONS}.
      */
     Capabilities capabilities(ObjectPath path);
 

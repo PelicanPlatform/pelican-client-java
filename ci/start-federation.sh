@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 #
-# Start a single-process Pelican federation for conformance tests.
+# Start a Pelican federation for conformance tests, as three separate processes:
 #
-# Tier 1: director + registry + origin, with the origin on the "posixv2" storage
-# backend.  That backend is Go-native, so `launchers/origin_serve.go` skips all
-# XRootD startup and the whole federation is one downloaded binary -- no
-# container image, no XRootD, no package installs.  A cache cannot join a
-# federation built this way (the cache launcher is unconditionally XRootD-based);
-# that is what the tier-2 job in the pelican-dev image is for.
+#   1. director + registry   the federation itself
+#   2. origin                 storage, on the native "posixv2" backend
+#   3. cache                  on the native "v2" (BadgerDB) backend
 #
-# Writes a shell-sourceable env file describing the federation, so the Java tests
-# find it without hard-coding anything.
+# Three processes rather than one because co-locating them hides bugs. A
+# single-process federation shares a config, a TLS identity, a hostname and a port
+# between services that are separate everywhere else, so anything that only breaks
+# across a process boundary -- registration, advertisement, a redirect between hosts,
+# a credential that does not travel -- passes there and fails in production.
+#
+# Neither native backend launches XRootD (serverLaunchesXrootd() is false for both), so
+# this still needs nothing but the downloaded binary: no container, no XRootD.
+#
+# Writes a shell-sourceable env file describing the federation, so the Java tests find
+# it without hard-coding anything.
 #
 # Usage:
 #   ci/start-federation.sh [env-file]        # default: /tmp/pelican-federation.env
@@ -18,32 +24,36 @@
 # Environment:
 #   PELICAN_VERSION   release to download (default below); "local" uses a
 #                     pelican-server already on PATH
-#   PELICAN_PORT      web port (default 8444)
 #   PELICAN_WORKDIR   where config, data and logs go (default /tmp/pelican-fed)
-#   PELICAN_WITH_CACHE  set to 1 to add a cache. Uses Cache.EnableV2, the native Go
-#                     (BadgerDB) cache, which launches no XRootD -- so a cache needs no
-#                     container either.
+#   PELICAN_WITH_CACHE  set to 0 to leave the cache out (default 1)
+#   PELICAN_FED_PORT / PELICAN_ORIGIN_PORT / PELICAN_CACHE_PORT
 
 set -euo pipefail
 
-PELICAN_VERSION="${PELICAN_VERSION:-7.26.2}"
-PELICAN_PORT="${PELICAN_PORT:-8444}"
+PELICAN_VERSION="${PELICAN_VERSION:-26.0.0-rc.0}"
 PELICAN_WORKDIR="${PELICAN_WORKDIR:-/tmp/pelican-fed}"
-PELICAN_WITH_CACHE="${PELICAN_WITH_CACHE:-0}"
+PELICAN_WITH_CACHE="${PELICAN_WITH_CACHE:-1}"
+FED_PORT="${PELICAN_FED_PORT:-8444}"
+ORIGIN_PORT="${PELICAN_ORIGIN_PORT:-8445}"
+CACHE_PORT="${PELICAN_CACHE_PORT:-8446}"
 ENV_FILE="${1:-/tmp/pelican-federation.env}"
 
-CONFIG_DIR="${PELICAN_WORKDIR}/config"
-DATA_DIR="${PELICAN_WORKDIR}/data"
 BIN_DIR="${PELICAN_WORKDIR}/bin"
-LOG_FILE="${PELICAN_WORKDIR}/server.log"
-PID_FILE="${PELICAN_WORKDIR}/server.pid"
+CA_BUNDLE="${PELICAN_WORKDIR}/ca-bundle.pem"
 
-DISCOVERY_URL="https://localhost:${PELICAN_PORT}"
+DISCOVERY_URL="https://localhost:${FED_PORT}"
+ORIGIN_URL="https://localhost:${ORIGIN_PORT}"
+CACHE_URL="https://localhost:${CACHE_PORT}"
 PUBLIC_PREFIX="/test/public"
 PROTECTED_PREFIX="/test/protected"
 
 log() { printf '==> %s\n' "$*" >&2; }
 fail() { printf '!!! %s\n' "$*" >&2; exit 1; }
+
+config_dir() { echo "${PELICAN_WORKDIR}/$1/config"; }
+data_dir()   { echo "${PELICAN_WORKDIR}/$1/data"; }
+log_file()   { echo "${PELICAN_WORKDIR}/$1.log"; }
+pid_file()   { echo "${PELICAN_WORKDIR}/$1.pid"; }
 
 # ---------------------------------------------------------------- the binary
 
@@ -54,7 +64,7 @@ install_pelican_server() {
     return
   fi
 
-  local os arch asset url
+  local os arch asset url found
   case "$(uname -s)" in
     Linux) os=Linux ;;
     Darwin) os=Darwin ;;
@@ -70,11 +80,8 @@ install_pelican_server() {
   asset="pelican-server_${os}_${arch}.tar.gz"
   url="https://github.com/PelicanPlatform/pelican/releases/download/v${PELICAN_VERSION}/${asset}"
   log "Downloading ${asset} (v${PELICAN_VERSION})"
-  curl -fsSL "${url}" -o "${PELICAN_WORKDIR}/${asset}" \
-    || fail "could not download ${url}"
+  curl -fsSL "${url}" -o "${PELICAN_WORKDIR}/${asset}" || fail "could not download ${url}"
   tar -xzf "${PELICAN_WORKDIR}/${asset}" -C "${PELICAN_WORKDIR}"
-  # The tarball unpacks into a versioned directory; find the binary wherever it landed.
-  local found
   found="$(find "${PELICAN_WORKDIR}" -name pelican-server -type f -perm -u+x | head -1)"
   [ -n "${found}" ] || fail "no pelican-server binary inside ${asset}"
   install -m 755 "${found}" "${BIN_DIR}/pelican-server"
@@ -83,12 +90,10 @@ install_pelican_server() {
 # ---------------------------------------------------------------- daemon user
 
 ensure_daemon_user() {
-  # config/privs.go looks up the "xrootd" system user only when the process runs
-  # as root; a non-root process uses its own identity and needs nothing. So this
-  # matters for container-based jobs (which run as root) and is a no-op on a
-  # normal runner. The user is needed even by a posixv2 origin that never starts
-  # XRootD, because the lookup sits outside the "does this server launch XRootD"
-  # check.
+  # config/privs.go looks up the "xrootd" system user only when the process runs as
+  # root; a non-root process uses its own identity. So this matters for container-based
+  # jobs and is a no-op on a normal runner. It is needed even though no XRootD is
+  # launched, because the lookup sits outside the "does this server launch XRootD" check.
   [ "$(id -u)" -eq 0 ] || return 0
   id xrootd >/dev/null 2>&1 && return 0
   if command -v useradd >/dev/null 2>&1; then
@@ -101,142 +106,194 @@ ensure_daemon_user() {
 }
 
 # ---------------------------------------------------------------- config
-
-write_config() {
-  mkdir -p "${DATA_DIR}/public" "${DATA_DIR}/protected" "${DATA_DIR}/cache"
-  echo "hello from a public namespace" > "${DATA_DIR}/public/hello.txt"
-  echo "0123456789" > "${DATA_DIR}/public/range.txt"
-  mkdir -p "${DATA_DIR}/public/subdir/nested"
-  echo "a" > "${DATA_DIR}/public/subdir/a.txt"
-  echo "bb" > "${DATA_DIR}/public/subdir/b.txt"
-  echo "deep" > "${DATA_DIR}/public/subdir/nested/deep.txt"
-  echo "protected contents" > "${DATA_DIR}/protected/secret.txt"
-
-  echo -n "conformance-placeholder" > "${CONFIG_DIR}/oidc-client-secret"
-
-  cat > "${CONFIG_DIR}/pelican.yaml" <<EOF
-# Generated by ci/start-federation.sh -- not a production configuration.
 #
-# ConfigBase is where generated state lands: the TLS CA, the issuer keys, the SQLite
-# databases. Pinning it keeps a test federation out of /etc/pelican (the root default)
-# and makes the CA findable at a known path.
-ConfigBase: ${CONFIG_DIR}
-# The server's own internal clients talk to this same self-signed instance. The Java
-# client under test does NOT skip verification: it is handed the generated CA instead,
-# so the real TLS path is exercised.
+# Shared by all three: each process gets its own ConfigBase, so each generates its own
+# TLS identity and issuer keys -- which is the point of running them separately.
+
+common_config() {
+  local role="$1" port="$2"
+  cat <<EOF
+# Generated by ci/start-federation.sh -- not a production configuration.
+ConfigBase: $(config_dir "${role}")
+# Each process trusts the others' self-signed certificates. The Java client under test
+# does NOT skip verification: it is handed a bundle of the three CAs instead, so the
+# real TLS path is exercised.
 TLSSkipVerify: true
-OIDC:
-  # The registry module refuses to start without an OIDC client configured, even though
-  # no browser login happens here.
-  ClientID: conformance-placeholder
-  ClientSecretFile: ${CONFIG_DIR}/oidc-client-secret
+Xrootd:
+  # Each service needs its own name. The registry records which key owns a server name,
+  # so two services sharing one name means the second cannot prove it owns the name the
+  # first registered -- which a single-process federation never shows, because there the
+  # services share a key. They have distinct hostnames in any real deployment; here they
+  # share a host and need distinct sitenames instead.
+  Sitename: conformance-${role}
 Server:
   HostName: localhost
-  WebPort: ${PELICAN_PORT}
+  WebPort: ${port}
   # The AUP gate would redirect authenticated pages to an "I agree" screen; no web UI
   # is exercised here.
   AUPFile: none
-  # Advertise often. A cache can only offer a namespace it learned about from the
-  # Director, so it needs one advertisement cycle after the origin registers before the
-  # Director will route reads to it -- at the 1m default that is a 90-second wait for
-  # something CI should not spend. The parameter exists to be shortened for tests.
+  # Advertise often. A cache can only offer a namespace it learned from the Director,
+  # so at the 1m default it is not routable until ~90s after the origin registers. The
+  # parameter exists to be shortened for tests.
   AdvertisementInterval: 5s
+  DbLocation: $(data_dir "${role}")/pelican.sqlite
 Federation:
   DiscoveryUrl: ${DISCOVERY_URL}
 Logging:
   Level: info
-Cache:
-  # The native Go cache. serverLaunchesXrootd() returns false for it, so a cache joins
-  # this federation without XRootD being installed anywhere.
-  EnableV2: true
-  Port: 8442
-  StorageLocation: ${DATA_DIR}/cache
+# Every stateful path, pinned per process. Several of these default to a SHARED
+# location under /var/lib/pelican when running as root, which three co-hosted processes
+# then fight over: the monitoring TSDB fails to take its lock and the process reports
+# itself unhealthy, and a shared pelican.sqlite makes the second process to start
+# collide on the admin user it tries to self-enroll. An unhealthy cache is then dropped
+# by the Director (Director.FilterCachesInErrorState defaults to true), so the symptom
+# is a cache that registers successfully and is never routed to.
+Monitoring:
+  DataLocation: $(data_dir "${role}")/monitoring
+EOF
+}
+
+write_fed_config() {
+  local dir data; dir="$(config_dir fed)"; data="$(data_dir fed)"
+  # The registry refuses to start without an OIDC client configured, even though no
+  # browser login happens here.
+  echo -n "conformance-placeholder" > "${dir}/oidc-client-secret"
+  {
+    common_config fed "${FED_PORT}"
+    cat <<EOF
+OIDC:
+  ClientID: conformance-placeholder
+  ClientSecretFile: ${dir}/oidc-client-secret
+Director:
+  DbLocation: ${data}/director.sqlite
+Registry:
+  DbLocation: ${data}/registry.sqlite
+EOF
+  } > "${dir}/pelican.yaml"
+}
+
+write_origin_config() {
+  local dir data; dir="$(config_dir origin)"; data="$(data_dir origin)"
+  mkdir -p "${data}/public/subdir/nested" "${data}/protected"
+  echo "hello from a public namespace" > "${data}/public/hello.txt"
+  echo "0123456789" > "${data}/public/range.txt"
+  echo "a" > "${data}/public/subdir/a.txt"
+  echo "bb" > "${data}/public/subdir/b.txt"
+  echo "deep" > "${data}/public/subdir/nested/deep.txt"
+  echo "protected contents" > "${data}/protected/secret.txt"
+  {
+    common_config origin "${ORIGIN_PORT}"
+    cat <<EOF
 Origin:
+  DbLocation: ${data}/origin.sqlite
   StorageType: posixv2
   Exports:
-    - StoragePrefix: "${DATA_DIR}/public"
+    - StoragePrefix: "${data}/public"
       FederationPrefix: "${PUBLIC_PREFIX}"
       Capabilities: ["PublicReads", "Writes", "Listings", "DirectReads"]
-    - StoragePrefix: "${DATA_DIR}/protected"
+    - StoragePrefix: "${data}/protected"
       FederationPrefix: "${PROTECTED_PREFIX}"
       Capabilities: ["Reads", "Writes", "Listings", "DirectReads"]
 EOF
+  } > "${dir}/pelican.yaml"
+}
+
+write_cache_config() {
+  local dir data; dir="$(config_dir cache)"; data="$(data_dir cache)"
+  mkdir -p "${data}/store"
+  {
+    common_config cache "${CACHE_PORT}"
+    cat <<EOF
+Cache:
+  DbLocation: ${data}/cache.sqlite
+  # The native Go cache. serverLaunchesXrootd() is false for it, so a cache joins this
+  # federation without XRootD installed anywhere.
+  EnableV2: true
+  Port: ${CACHE_PORT}
+  StorageLocation: ${data}/store
+EOF
+  } > "${dir}/pelican.yaml"
 }
 
 # ---------------------------------------------------------------- lifecycle
 
-modules() {
-  if [ "${PELICAN_WITH_CACHE}" = "1" ]; then
-    echo "director,registry,origin,cache"
-  else
-    echo "director,registry,origin"
-  fi
-}
-
-start_server() {
-  local module_list
-  module_list="$(modules)"
-  log "Starting ${module_list} on port ${PELICAN_PORT}"
+start_process() {
+  local role="$1" modules="$2" dir; dir="$(config_dir "${role}")"
+  log "Starting ${role} (${modules})"
   (
-    export PELICAN_CONFIGBASE="${CONFIG_DIR}"
-    # --config explicitly, rather than relying on config-directory discovery:
-    # where a bare pelican.yaml is picked up from has changed between releases,
-    # and a silently-ignored config file shows up as a baffling "prefix is empty"
-    # rather than as a missing file.
+    export PELICAN_CONFIGBASE="${dir}"
     exec "${BIN_DIR}/pelican-server" serve \
-      --config "${CONFIG_DIR}/pelican.yaml" \
-      --module "${module_list}"
-  ) > "${LOG_FILE}" 2>&1 &
-  echo $! > "${PID_FILE}"
+      --config "${dir}/pelican.yaml" \
+      --module "${modules}"
+  ) > "$(log_file "${role}")" 2>&1 &
+  echo $! > "$(pid_file "${role}")"
 }
 
-# A cache is only useful once the Director will actually route a read to it, which
-# needs one advertisement cycle after the origin registers. Waiting for the ad rather
-# than for the process means a test that expects two servers reliably gets two.
-wait_for_cache() {
-  [ "${PELICAN_WITH_CACHE}" = "1" ] || return 0
-  local attempt
-  for attempt in $(seq 1 40); do
-    if curl -skD- -o /dev/null "${DISCOVERY_URL}${PUBLIC_PREFIX}/hello.txt" \
-        | grep -i '^link:' | grep -qi 'cache'; then
-      log "Director is offering the cache after ${attempt} poll(s)"
-      return 0
-    fi
-    sleep 3
-  done
-  log "Director never offered the cache; last 40 lines:"
-  tail -40 "${LOG_FILE}" >&2
-  fail "timed out waiting for the cache to be advertised"
+alive() {
+  local role="$1" pid
+  pid="$(cat "$(pid_file "${role}")" 2>/dev/null || true)"
+  [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
 }
 
-wait_until_ready() {
-  local pid attempt
-  pid="$(cat "${PID_FILE}")"
+die_with_log() {
+  local role="$1" why="$2"
+  log "${role}: ${why}; last 40 lines of $(log_file "${role}"):"
+  tail -40 "$(log_file "${role}")" >&2
+  fail "${role} did not come up"
+}
+
+# Wait for one process to answer on its own web port and to have minted its issuer key.
+wait_for_process() {
+  local role="$1" url="$2" attempt
   for attempt in $(seq 1 60); do
-    # Fail fast if it died, rather than burning the whole timeout on a corpse.
-    if ! kill -0 "${pid}" 2>/dev/null; then
-      log "Server exited during startup; last 40 lines:"
-      tail -40 "${LOG_FILE}" >&2
-      fail "pelican-server died before becoming ready"
-    fi
-    if curl -sk "${DISCOVERY_URL}/api/v1.0/health" >/dev/null 2>&1 \
-        && curl -sk "${DISCOVERY_URL}/.well-known/pelican-configuration" >/dev/null 2>&1 \
-        && compgen -G "${CONFIG_DIR}/issuer-keys/*.pem" >/dev/null; then
-      log "Ready after ${attempt} poll(s)"
+    alive "${role}" || die_with_log "${role}" "process exited during startup"
+    if curl -sk "${url}/api/v1.0/health" >/dev/null 2>&1 \
+        && compgen -G "$(config_dir "${role}")/issuer-keys/*.pem" >/dev/null; then
+      log "${role} ready after ${attempt} poll(s)"
       return 0
     fi
     sleep 2
   done
-  log "Server never became ready; last 40 lines:"
-  tail -40 "${LOG_FILE}" >&2
-  fail "timed out waiting for the federation"
+  die_with_log "${role}" "never became ready"
+}
+
+# Wait for the Director to actually route to a server, which is a stronger condition than
+# the server being up: it has to have registered and advertised first.
+wait_for_advertisement() {
+  local what="$1" attempt link
+  for attempt in $(seq 1 40); do
+    alive origin || die_with_log origin "process exited while waiting for advertisement"
+    link="$(curl -skD- -o /dev/null "${DISCOVERY_URL}${PUBLIC_PREFIX}/hello.txt" 2>/dev/null \
+            | grep -i '^link:' || true)"
+    if [ -n "${link}" ] && { [ "${what}" = "any" ] || echo "${link}" | grep -qi "${what}"; }; then
+      log "Director is routing to ${what} after ${attempt} poll(s)"
+      return 0
+    fi
+    sleep 3
+  done
+  log "Director never advertised ${what}; director log:"
+  tail -30 "$(log_file fed)" >&2
+  fail "timed out waiting for ${what} to be advertised"
+}
+
+# Each process has its own CA. The client is given all of them, rather than being told to
+# skip verification, so the TLS path it uses in production is the one under test.
+build_ca_bundle() {
+  local role ca
+  : > "${CA_BUNDLE}"
+  for role in fed origin cache; do
+    ca="$(config_dir "${role}")/certificates/tlsca.pem"
+    [ -f "${ca}" ] && cat "${ca}" >> "${CA_BUNDLE}"
+  done
+  grep -c "BEGIN CERTIFICATE" "${CA_BUNDLE}" >/dev/null \
+    || fail "no CA certificates collected into ${CA_BUNDLE}"
+  log "Collected $(grep -c 'BEGIN CERTIFICATE' "${CA_BUNDLE}") CA certificate(s)"
 }
 
 mint_token() {
-  # Ask the Director which issuer this namespace accepts, rather than assuming.
-  # Which issuer serves a namespace depends on whether the origin runs a per-export
-  # issuer, and the answer has moved between releases -- so read it off
-  # X-Pelican-Token-Generation, which is the authoritative statement.
+  # Ask the Director which issuer the namespace accepts, rather than assuming: which
+  # issuer serves a namespace depends on the origin's configuration and has moved between
+  # releases. X-Pelican-Token-Generation is the authoritative statement.
   local issuer
   issuer="$(curl -skD- -o /dev/null "${DISCOVERY_URL}${PROTECTED_PREFIX}/probe" \
             | tr -d '\r' \
@@ -245,14 +302,17 @@ mint_token() {
   [ -n "${issuer}" ] || fail "the Director advertised no token issuer for ${PROTECTED_PREFIX}"
   log "Namespace issuer: ${issuer}"
 
-  # Scopes are relative to the namespace's base path (also advertised by the
-  # Director), so "/" means all of ${PROTECTED_PREFIX}.
-  PELICAN_CONFIGBASE="${CONFIG_DIR}" "${BIN_DIR}/pelican-server" origin token create \
-    --config "${CONFIG_DIR}/pelican.yaml" \
+  # Signed with the origin's key, so this runs against the origin's ConfigBase. Scopes are
+  # relative to the namespace's base path, so "/" means all of ${PROTECTED_PREFIX}. The
+  # WLCG wildcard audience avoids having to guess Origin.TokenAudience, which defaults to
+  # the origin's data port rather than its web port.
+  PELICAN_CONFIGBASE="$(config_dir origin)" "${BIN_DIR}/pelican-server" origin token create \
+    --config "$(config_dir origin)/pelican.yaml" \
     --profile wlcg \
     --scope "storage.read:/ storage.create:/ storage.modify:/" \
     --issuer "${issuer}" \
     --audience "${DISCOVERY_URL}" \
+    --audience "${ORIGIN_URL}" \
     --audience "${issuer}" \
     --audience "https://wlcg.cern.ch/jwt/v1/any" \
     --lifetime 7200 \
@@ -263,30 +323,51 @@ write_env_file() {
   local token="$1"
   cat > "${ENV_FILE}" <<EOF
 export PELICAN_TEST_DISCOVERY_URL="${DISCOVERY_URL}"
-export PELICAN_TEST_CA_FILE="${CONFIG_DIR}/certificates/tlsca.pem"
+export PELICAN_TEST_CA_FILE="${CA_BUNDLE}"
 export PELICAN_TEST_PUBLIC_PREFIX="${PUBLIC_PREFIX}"
 export PELICAN_TEST_PROTECTED_PREFIX="${PROTECTED_PREFIX}"
 export PELICAN_TEST_TOKEN="${token}"
-export PELICAN_TEST_LOG="${LOG_FILE}"
-export PELICAN_TEST_PID="${PID_FILE}"
+export PELICAN_TEST_ORIGIN_URL="${ORIGIN_URL}"
+export PELICAN_TEST_CACHE_URL="${CACHE_URL}"
 export PELICAN_TEST_HAS_CACHE="${PELICAN_WITH_CACHE}"
+export PELICAN_TEST_WORKDIR="${PELICAN_WORKDIR}"
 EOF
   log "Wrote ${ENV_FILE}"
 }
 
 main() {
-  mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${BIN_DIR}"
+  mkdir -p "${BIN_DIR}"
+  local role
+  for role in fed origin cache; do
+    mkdir -p "$(config_dir "${role}")" "$(data_dir "${role}")"
+  done
+
   install_pelican_server
   ensure_daemon_user
-  write_config
-  start_server
-  wait_until_ready
-  wait_for_cache
+
+  write_fed_config
+  start_process fed "director,registry"
+  wait_for_process fed "${DISCOVERY_URL}"
+
+  write_origin_config
+  start_process origin "origin"
+  wait_for_process origin "${ORIGIN_URL}"
+  wait_for_advertisement any
+
+  if [ "${PELICAN_WITH_CACHE}" = "1" ]; then
+    write_cache_config
+    start_process cache "cache"
+    wait_for_process cache "${CACHE_URL}"
+    # Match on the cache's address: its URL contains no literal "cache".
+    wait_for_advertisement "localhost:${CACHE_PORT}"
+  fi
+
+  build_ca_bundle
   local token
   token="$(mint_token)"
   [ -n "${token}" ] || fail "could not mint a test token"
   write_env_file "${token}"
-  log "Federation is up. Stop it with: kill \$(cat ${PID_FILE})"
+  log "Federation is up. Stop it with: ci/stop-federation.sh"
 }
 
 main "$@"

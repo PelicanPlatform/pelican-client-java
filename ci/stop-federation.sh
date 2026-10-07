@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Stop a federation started by start-federation.sh, and print its log on request.
+# Stop a federation started by start-federation.sh.
 set -uo pipefail
 PELICAN_WORKDIR="${PELICAN_WORKDIR:-/tmp/pelican-fed}"
-PID_FILE="${PELICAN_WORKDIR}/server.pid"
-if [ -f "${PID_FILE}" ]; then
-  pid="$(cat "${PID_FILE}")"
-  kill "${pid}" 2>/dev/null && echo "==> Stopped pelican-server (pid ${pid})" >&2
-  rm -f "${PID_FILE}"
-fi
+for role in cache origin fed; do
+  pid_file="${PELICAN_WORKDIR}/${role}.pid"
+  if [ -f "${pid_file}" ]; then
+    pid="$(cat "${pid_file}")"
+    if kill "${pid}" 2>/dev/null; then
+      echo "==> Stopped ${role} (pid ${pid})" >&2
+    fi
+    rm -f "${pid_file}"
+  fi
+done

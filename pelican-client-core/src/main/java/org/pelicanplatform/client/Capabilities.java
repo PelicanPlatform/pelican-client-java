@@ -30,6 +30,10 @@ import java.util.TreeSet;
  * {@code COPY} appears only where third-party copy is enabled.  A caller that needs to
  * degrade gracefully (offer a "rename" button, or proxy bytes instead of asking for a
  * server-side copy) can check here instead of catching a 405 after the fact.
+ *
+ * <p>This answers for <em>one path</em>, not for a server. Origins vary their {@code Allow}
+ * by what the path is: the same origin advertises {@code GET, HEAD, PUT} on an object and
+ * {@code DELETE, MOVE, PROPPATCH} on a collection. Ask about the path you mean to act on.
  */
 public final class Capabilities {
 

@@ -276,9 +276,10 @@ class FederationConformanceTest {
     }
 
     /**
-     * Also covers the collection redirect: a real origin answers {@code OPTIONS} of a
-     * collection with a 307 to its trailing-slash form, and a client that treats that as a
-     * failure cannot ask any origin what it supports.
+     * Also covers two things a single-process federation cannot show: that {@code OPTIONS}
+     * is asked of an origin rather than of a cache (a cache answers 405), and the collection
+     * redirect, where an origin answers {@code OPTIONS} of a collection with a 307 to its
+     * trailing-slash form.
      */
     @Test
     void reportsTheVerbsTheOriginServes() {

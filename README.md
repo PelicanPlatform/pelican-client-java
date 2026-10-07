@@ -76,9 +76,12 @@ mvn test -Dtest.excludedGroups= -Dgroups=federation
 ci/stop-federation.sh
 ```
 
-That brings up a director, registry, origin and cache from one downloaded binary in about
-ten seconds. No XRootD and no container: both native backends (`Origin.StorageType:
-posixv2` and `Cache.EnableV2`) start none. Needs Pelican 26.0.0-rc.0 or later — earlier
+That brings up **three separate processes** — director+registry, origin, cache — from one
+downloaded binary. Separate rather than co-located because a single-process federation
+shares a config, a TLS identity, a hostname and a database between services that are
+separate everywhere else, and hides the bugs that only appear across a process boundary.
+No XRootD and no container: both native backends (`Origin.StorageType: posixv2` and
+`Cache.EnableV2`) start none. Needs Pelican 26.0.0-rc.0 or later — earlier
 releases demand an XRootD binary even for a backend that never starts one.
 
 Conformance tests are excluded from `mvn test` by default, so the ordinary build stays

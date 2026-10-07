@@ -5,9 +5,13 @@ name: Conformance
 # check this library's reading of the protocol against a server rather than against its
 # own fake.
 #
-# The whole federation -- director, registry, origin and cache -- runs from one
-# downloaded binary on a plain runner. Neither native backend starts XRootD:
+# The federation runs as three separate processes -- director+registry, origin, cache --
+# from one downloaded binary on a plain runner. Neither native backend starts XRootD:
 # Origin.StorageType=posixv2 and Cache.EnableV2 both make serverLaunchesXrootd() false.
+#
+# Separate processes because co-locating them hides bugs: a single-process federation
+# shares a config, a TLS identity, an issuer key, a hostname and a database between
+# services that are separate everywhere else.
 #
 # The one thing this cannot cover is XRootD's own behavior, which differs from the
 # native implementations in ways the client has to handle -- an XRootD cache answers
@@ -56,7 +60,7 @@ jobs:
       - run: mvn --batch-mode verify
 
   federation:
-    name: Conformance (origin + cache)
+    name: Conformance (3-process federation)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
